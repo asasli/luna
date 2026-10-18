@@ -1,14 +1,26 @@
 """LUNAPipeline — orchestrates scorers, combiner, thresholding, and reporting."""
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
+import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 from luna.scorers import SCORER_REGISTRY, get_available_scorers, get_scorer_families
-from luna.combiners import get_combiner, BaseCombiner
-from luna.thresholding import calibrate_threshold, apply_threshold
+from luna.combiners import get_combiner, BaseCombiner, MeanRankCombiner
+from luna.thresholding import calibrate_threshold, calibrate_thresholds, apply_threshold, p_values
+
+
+def _take(data: dict, idx: np.ndarray) -> dict:
+    """Rows `idx` of every array in a data dict (None values are kept)."""
+    return {k: (None if v is None else np.asarray(v)[idx]) for k, v in data.items()}
+
+
+def _n_rows(data: dict) -> int:
+    return len(next(np.asarray(v) for v in data.values() if v is not None))
 
 
 class LUNAPipeline:
@@ -22,18 +34,23 @@ class LUNAPipeline:
       5. Full prediction (scores + ensemble + flags)
       6. Report + visualization generation
 
-    Example:
-        pipe = LUNAPipeline(scorers=["knn", "iforest", "msp"], combiner="lightgbm")
+    Example (with labelled outliers):
+        pipe = LUNAPipeline(combiner="lightgbm", target_far=(0.01, 0.05, 0.10))
         pipe.fit(train_data)
-        pipe.fit_combiner(val_data, rare_data)
-        result = pipe.predict(new_data)
+        pipe.fit_combiner(val_data, rare_data)          # half of val_data calibrates
+        result = pipe.predict(new_data)                 # p_value, flags at 1%, 5%, 10%
+
+    Example (blind, no labelled outlier):
+        pipe = LUNAPipeline(target_far=(0.01, 0.05, 0.10)).fit(train_data)
+        pipe.fit_blind(val_data)    # mean percentile rank, frozen reference ranks
+        table = pipe.evaluate(test_normals, rare_data, groups=rare_families)
     """
 
     def __init__(
         self,
         scorers: list[str] | None = None,
         combiner: str | BaseCombiner = "lightgbm",
-        target_far: float = 0.01,
+        target_far: float | Sequence[float] = 0.01,
         fine_to_coarse: dict[int, int] | None = None,
         scorer_kwargs: dict[str, dict] | None = None,
         combiner_kwargs: dict | None = None,
@@ -42,14 +59,18 @@ class LUNAPipeline:
         Args:
             scorers: list of scorer names to use, or None for auto-detection.
             combiner: combiner name or BaseCombiner instance.
-            target_far: false-alarm rate for threshold calibration (default 1%).
+            target_far: false-alarm rate(s) for threshold calibration (default 1%). A
+                sequence, e.g. (0.01, 0.05, 0.10), calibrates one threshold per rate; the
+                first entry is the main operating point (`flagged`).
             fine_to_coarse: mapping fine class idx -> coarse class idx (for HEC).
             scorer_kwargs: per-scorer kwargs, e.g. {"odin": {"temperature": 2.0}}.
             combiner_kwargs: kwargs passed to the combiner constructor.
         """
         self._requested_scorers = scorers
         self._combiner_spec = combiner
-        self.target_far = target_far
+        fars = (target_far,) if np.isscalar(target_far) else tuple(target_far)
+        self.fars = tuple(float(a) for a in fars)
+        self.target_far = self.fars[0]
         self.fine_to_coarse = fine_to_coarse
         self._scorer_kwargs = scorer_kwargs or {}
         self._combiner_kwargs = combiner_kwargs or {}
@@ -57,6 +78,9 @@ class LUNAPipeline:
         self._scorers: dict[str, object] = {}
         self._combiner: BaseCombiner | None = None
         self._threshold: float | None = None
+        self._thresholds: dict[float, float] = {}
+        self._cal_scores: np.ndarray | None = None
+        self._cal_method_scores: dict[str, np.ndarray] | None = None
         self._active_methods: list[str] = []
         self._fitted = False
         self._combiner_fitted = False
@@ -151,13 +175,23 @@ class LUNAPipeline:
         self,
         id_data: dict[str, np.ndarray],
         ood_data: dict[str, np.ndarray],
+        calibration_data: dict[str, np.ndarray] | None = None,
+        cal_fraction: float = 0.5,
+        seed: int = 0,
         verbose: bool = True,
     ) -> LUNAPipeline:
-        """Fit the combiner on ID (validation) vs OOD (rare/anomaly) data.
+        """Fit the combiner on ID (validation) vs OOD (rare/anomaly) data, then calibrate.
 
         Args:
-            id_data: in-distribution data dict.
-            ood_data: out-of-distribution / anomaly data dict.
+            id_data: in-distribution data.
+            ood_data: out-of-distribution / anomaly data.
+            calibration_data: held-out in-distribution data for the thresholds. When None,
+                a random fraction `cal_fraction` of `id_data` is set aside for calibration
+                and the combiner is fitted on the rest, so the thresholds are never set on
+                objects the combiner has seen.
+            cal_fraction: fraction of `id_data` used for calibration when no
+                `calibration_data` is given.
+            seed: random seed of that split.
             verbose: print AUROC and threshold info.
 
         Returns:
@@ -165,49 +199,98 @@ class LUNAPipeline:
         """
         if not self._fitted:
             raise RuntimeError("Call .fit() before .fit_combiner().")
+        if calibration_data is None:
+            id_data, calibration_data = self._split(id_data, cal_fraction, seed)
 
-        id_scores = self.score(id_data)
-        ood_scores = self.score(ood_data)
-
-        X_id = self._scores_to_matrix(id_scores)
-        X_ood = self._scores_to_matrix(ood_scores)
-
+        X_id = self._scores_to_matrix(self.score(id_data))
+        X_ood = self._scores_to_matrix(self.score(ood_data))
         X = np.vstack([X_id, X_ood])
         y = np.concatenate([
             np.zeros(X_id.shape[0], dtype=int),
             np.ones(X_ood.shape[0], dtype=int),
         ])
 
-        # Instantiate combiner
         self._combiner = get_combiner(self._combiner_spec, **self._combiner_kwargs)
-
-        # Cross-validation
         if verbose:
             cv_aurocs = self._combiner.cross_val_auroc(X, y)
             print(f"  [LUNA] Combiner CV AUROC = {cv_aurocs.mean():.4f} "
                   f"+/- {cv_aurocs.std():.4f}")
-
-        # Full fit
         self._combiner.fit(X, y)
-        ens = self._combiner.predict(X)
-        ens_id = ens[:X_id.shape[0]]
-
-        if verbose:
-            full_auroc = roc_auc_score(y, ens)
-            print(f"  [LUNA] Full-fit AUROC = {full_auroc:.4f}")
-
-        # Calibrate threshold
-        self._threshold = calibrate_threshold(ens_id, self.target_far)
-        if verbose:
-            n_fp = (ens_id > self._threshold).sum()
-            print(f"  [LUNA] Threshold @ FAR={self.target_far:.1%}: {self._threshold:.4f} "
-                  f"(val FP={n_fp}/{len(ens_id)})")
-
         self._combiner_fitted = True
+        return self.calibrate(calibration_data, verbose=verbose)
+
+    def fit_blind(
+        self,
+        reference_data: dict[str, np.ndarray],
+        calibration_data: dict[str, np.ndarray] | None = None,
+        cal_fraction: float = 0.5,
+        seed: int = 0,
+        verbose: bool = True,
+    ) -> LUNAPipeline:
+        """Blind consensus: mean percentile rank across the scorers, no labelled anomaly.
+
+        The percentile of each scorer is read from the reference in-distribution objects and
+        frozen, so the consensus of an object does not depend on the other objects scored
+        with it. The thresholds are set on separate calibration objects.
+
+        Args:
+            reference_data: in-distribution data that defines the percentile ranks.
+            calibration_data: held-out in-distribution data for the thresholds. When None,
+                a random fraction `cal_fraction` of `reference_data` is used.
+            cal_fraction, seed: as in `fit_combiner`.
+            verbose: print threshold info.
+
+        Returns:
+            self
+        """
+        if not self._fitted:
+            raise RuntimeError("Call .fit() before .fit_blind().")
+        if calibration_data is None:
+            reference_data, calibration_data = self._split(reference_data, cal_fraction, seed)
+        X_ref = self._scores_to_matrix(self.score(reference_data))
+        self._combiner = MeanRankCombiner().fit(X_ref, np.zeros(len(X_ref), dtype=int))
+        self._combiner_fitted = True
+        return self.calibrate(calibration_data, verbose=verbose)
+
+    def calibrate(
+        self, calibration_data: dict[str, np.ndarray], verbose: bool = True,
+    ) -> LUNAPipeline:
+        """Set the thresholds and the p-value reference on held-out in-distribution data.
+
+        Can be called again on new normals (e.g. a new survey season) without refitting.
+        """
+        if not self._combiner_fitted:
+            raise RuntimeError("Fit a combiner (fit_combiner or fit_blind) first.")
+        cal_scores = self.score(calibration_data)
+        cal = self._combiner.predict(self._scores_to_matrix(cal_scores))
+        self._cal_scores = np.sort(cal)
+        self._cal_method_scores = {m: np.sort(v) for m, v in cal_scores.items()}
+        self._thresholds = calibrate_thresholds(cal, self.fars)
+        self._threshold = self._thresholds[self.target_far]
+        if verbose:
+            n = len(cal)
+            for a, thr in self._thresholds.items():
+                small = " (too few calibration objects for this rate)" if (n + 1) * a < 1 else ""
+                print(f"  [LUNA] Threshold @ FAR={a:.1%}: {thr:.4f} on {n} calibration "
+                      f"objects{small}")
         return self
 
+    @staticmethod
+    def _split(data: dict, fraction: float, seed: int) -> tuple[dict, dict]:
+        n = _n_rows(data)
+        perm = np.random.default_rng(seed).permutation(n)
+        n_cal = int(round(fraction * n))
+        if n_cal < 1 or n_cal >= n:
+            raise ValueError(f"cannot split {n} objects with cal_fraction={fraction}")
+        return _take(data, perm[n_cal:]), _take(data, perm[:n_cal])
+
+    @property
+    def thresholds(self) -> dict[float, float]:
+        """Calibrated threshold per false-alarm rate."""
+        return dict(self._thresholds)
+
     def predict(self, data: dict[str, np.ndarray]) -> dict:
-        """Full prediction: scores + ensemble + threshold + flags.
+        """Full prediction: scores, ensemble, conformal p-value and flags at every rate.
 
         Args:
             data: input data dict.
@@ -216,74 +299,133 @@ class LUNAPipeline:
             Dict with:
                 "scores": dict of per-scorer arrays
                 "ensemble_score": (N,) combined anomaly score
-                "flagged": (N,) boolean array
-                "threshold": float
+                "p_value": (N,) conformal p-value against the calibration objects
+                "flagged": (N,) boolean array at the main rate (first `target_far`)
+                "flags": {far: (N,) boolean array} for every calibrated rate
+                "threshold": float, main-rate threshold
+                "thresholds": {far: threshold}
         """
-        if not self._combiner_fitted:
-            raise RuntimeError("Call .fit_combiner() before .predict().")
+        if not self._combiner_fitted or self._cal_scores is None:
+            raise RuntimeError("Call .fit_combiner() or .fit_blind() before .predict().")
 
         scores = self.score(data)
-        X = self._scores_to_matrix(scores)
-        ens = self._combiner.predict(X)
-        flagged = apply_threshold(ens, self._threshold)
-
+        ens = self._combiner.predict(self._scores_to_matrix(scores))
+        flags = {a: apply_threshold(ens, thr) for a, thr in self._thresholds.items()}
         return {
             "scores": scores,
             "ensemble_score": ens,
-            "flagged": flagged,
+            "p_value": p_values(ens, self._cal_scores),
+            "flagged": flags[self.target_far],
+            "flags": flags,
             "threshold": self._threshold,
+            "thresholds": dict(self._thresholds),
         }
+
+    def evaluate(
+        self,
+        id_data: dict[str, np.ndarray],
+        ood_data: dict[str, np.ndarray],
+        groups: Sequence[str] | None = None,
+        methods: bool = False,
+    ) -> pd.DataFrame:
+        """Detection table at every calibrated rate.
+
+        `id_data` must be independent in-distribution test objects (not the reference or
+        calibration objects), so that the realised false-alarm rate is an honest estimate.
+
+        Args:
+            id_data: independent in-distribution test objects.
+            ood_data: anomalies.
+            groups: optional label per anomaly (e.g. its family), for per-group rows.
+            methods: also report every single scorer, thresholded on the same calibration
+                objects (requires the calibration scores, kept by `calibrate`).
+
+        Returns:
+            DataFrame with one row per (rule, rate, group): target FAR, realised FPR on
+            `id_data`, AUROC, number detected and detection rate.
+        """
+        pi, po = self.predict(id_data), self.predict(ood_data)
+        rules = {"ensemble": (pi["ensemble_score"], po["ensemble_score"], self._thresholds)}
+        if methods:
+            if getattr(self, "_cal_method_scores", None) is None:
+                raise RuntimeError("per-method thresholds need calibrate() from v0.3")
+            for m in self._active_methods:
+                rules[m] = (pi["scores"][m], po["scores"][m],
+                            calibrate_thresholds(self._cal_method_scores[m], self.fars))
+        groups = None if groups is None else np.asarray(groups)
+        sel = {"all": np.ones(len(po["ensemble_score"]), bool)}
+        if groups is not None:
+            sel.update({g: groups == g for g in sorted(set(groups))})
+        rows = []
+        for rule, (si, so, thr) in rules.items():
+            for a, t in thr.items():
+                fpr = float((si > t).mean())
+                for g, mask in sel.items():
+                    n = int(mask.sum())
+                    y = np.r_[np.zeros(len(si)), np.ones(n)]
+                    rows.append(dict(rule=rule, target_far=a, realised_fpr=fpr, group=g, n=n,
+                                     auroc=roc_auc_score(y, np.r_[si, so[mask]]),
+                                     detected=int((so[mask] > t).sum()),
+                                     det_rate=float((so[mask] > t).mean())))
+        return pd.DataFrame(rows)
+
+    def save(self, path: str | Path) -> None:
+        """Pickle the fitted pipeline (scorers, combiner, calibration)."""
+        from luna import __version__
+        with open(path, "wb") as f:
+            pickle.dump(dict(luna_version=__version__, pipeline=self), f)
+
+    @staticmethod
+    def load(path: str | Path) -> LUNAPipeline:
+        """Load a pipeline written by `save`. Only load files you trust (pickle)."""
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        return obj["pipeline"]
 
     def family_analysis(
         self,
         id_data: dict[str, np.ndarray],
         ood_data: dict[str, np.ndarray],
+        seed: int = 0,
     ) -> dict:
         """Per-family AUROC and detection analysis.
 
+        Within each scorer family, the scores are combined as the mean percentile rank. The
+        ranks are read from one half of `id_data` and frozen, the thresholds are set on the
+        other half, and the AUROC compares that second half with the anomalies, so the result
+        for an anomaly does not depend on which other anomalies are scored with it.
+
         Args:
-            id_data: in-distribution data.
+            id_data: in-distribution data (not used to fit the scorers).
             ood_data: out-of-distribution data.
+            seed: random seed of the reference/calibration split of `id_data`.
 
         Returns:
-            Dict with per-family AUROC, detection counts, and flag arrays.
+            Dict with per-family AUROC, detection counts and flags at the main rate, and the
+            detection rate at every calibrated rate ("det_rate_by_far").
         """
-        id_scores = self.score(id_data)
-        ood_scores = self.score(ood_data)
-        n_id = len(next(iter(id_scores.values())))
-        n_ood = len(next(iter(ood_scores.values())))
-        y = np.concatenate([np.zeros(n_id), np.ones(n_ood)])
+        ref_data, cal_data = self._split(id_data, 0.5, seed)
+        ref, cal, ood = (self.score(d) for d in (ref_data, cal_data, ood_data))
+        n_cal = len(next(iter(cal.values())))
+        n_ood = len(next(iter(ood.values())))
+        y = np.concatenate([np.zeros(n_cal), np.ones(n_ood)])
 
-        families = self.families
         result = {}
-
-        for fam, methods in families.items():
-            # Mean-rank ensemble within family
-            rank_id = np.zeros(n_id)
-            rank_ood = np.zeros(n_ood)
-            for m in methods:
-                full = np.concatenate([id_scores[m], ood_scores[m]])
-                r = full.argsort().argsort().astype(float) / max(1, len(full) - 1)
-                rank_id += r[:n_id]
-                rank_ood += r[n_id:]
-            rank_id /= len(methods)
-            rank_ood /= len(methods)
-
-            full_rank = np.concatenate([rank_id, rank_ood])
-            auroc = roc_auc_score(y, full_rank)
-
-            # Threshold at same FAR
-            thr = calibrate_threshold(rank_id, self.target_far)
-            flags = rank_ood > thr
-
+        for fam, methods in self.families.items():
+            comb = MeanRankCombiner().fit(np.column_stack([ref[m] for m in methods]),
+                                          np.zeros(len(ref[methods[0]]), dtype=int))
+            rank_cal = comb.predict(np.column_stack([cal[m] for m in methods]))
+            rank_ood = comb.predict(np.column_stack([ood[m] for m in methods]))
+            thr = calibrate_thresholds(rank_cal, self.fars)
+            flags = rank_ood > thr[self.target_far]
             result[fam] = {
-                "auroc": auroc,
+                "auroc": roc_auc_score(y, np.concatenate([rank_cal, rank_ood])),
                 "detected": int(flags.sum()),
                 "total": n_ood,
                 "det_rate": flags.mean(),
                 "flags": flags,
+                "det_rate_by_far": {a: float((rank_ood > v).mean()) for a, v in thr.items()},
             }
-
         return result
 
     def report(
@@ -322,11 +464,10 @@ class LUNAPipeline:
         fam_analysis = self.family_analysis(id_data, ood_data)
 
         # Per-method flags for detection map
-        id_scores = self.score(id_data)
         ood_scores = pred["scores"]
         method_flags = {}
-        for m in self._active_methods:
-            thr = calibrate_threshold(id_scores[m], self.target_far)
+        for m in self._active_methods:      # single scorers, thresholded on the calibration objects
+            thr = calibrate_threshold(self._cal_method_scores[m], self.target_far)
             method_flags[m] = ood_scores[m] > thr
 
         # Family flags
@@ -338,11 +479,16 @@ class LUNAPipeline:
         else:
             true_classes = None
 
+        # Detection at every calibrated rate, with the realised FPR on id_data
+        self.evaluate(id_data, ood_data, groups=true_classes, methods=True).to_csv(
+            out_dir / "detection_by_far.csv", index=False)
+
         # Anomaly report CSV
         report_df = generate_anomaly_report(
             scores=ood_scores,
             ensemble_score=pred["ensemble_score"],
             flags=pred["flagged"],
+            p_value=pred["p_value"],
             meta=meta,
             class_names=class_names,
             logits=ood_data.get("logits"),

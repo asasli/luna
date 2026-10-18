@@ -31,29 +31,44 @@ train = {"embeddings": Ztr, "logits": Ltr, "labels": ytr}   # in-distribution tr
 val   = {"embeddings": Zva, "logits": Lva, "labels": yva}   # in-distribution holdout
 query = {"embeddings": Zq,  "logits": Lq}                   # anything you want to score
 
-pipe = LUNAPipeline(combiner="lightgbm", target_far=0.01)
+pipe = LUNAPipeline(target_far=(0.01, 0.05, 0.10))
 pipe.fit(train)                       # fits the 16 scorers on ID statistics
 
 scores = pipe.score(query)            # dict: {"msp": ..., "mahal_within": ..., ...}
 
-# Optional: supervised combiner if you have a small set of known outliers
+# Blind consensus, no labelled outlier needed: mean percentile rank across the scorers,
+# with the ranks frozen on half of `val` and the thresholds set on the other half
+pipe.fit_blind(val)
+out = pipe.predict(query)             # ensemble_score, p_value, flags at 1%, 5% and 10%
+
+# Or a supervised combiner, if you have a small set of known outliers
+# (half of `val` is kept aside for the thresholds; pass calibration_data= to choose it)
 pipe.fit_combiner(val, known_outliers)
-out = pipe.predict(query)             # combined score + flags at target FAR
+
+# Detection and realised false-alarm rate at every rate, on independent test normals
+table = pipe.evaluate(test_normals, outliers, groups=outlier_families, methods=True)
 ```
+
+`p_value` is the conformal p-value of each object against the calibration normals, so
+flagging `p_value <= a` reproduces the threshold at rate `a`, and one calibration serves
+every operating point. `calibrate(new_normals)` resets the thresholds without refitting.
+`save(path)` and `LUNAPipeline.load(path)` keep a fitted pipeline.
 
 Optional input keys: `coarse_logits` (hierarchical heads), `projections`
 (contrastive projection head) — scorers that need a missing key are skipped
-automatically. `family_analysis(id_data, ood_data)` gives per-family AUROC,
-detections and flags; `report(...)` produces a ranked anomaly table.
+automatically. `family_analysis(id_data, ood_data)` gives per-family AUROC and
+detections at every rate; `report(...)` writes a ranked anomaly table and
+`detection_by_far.csv`.
 
 ## What's inside
 
 ```
 luna/
-  pipeline.py      LUNAPipeline: fit / score / fit_combiner / predict / family_analysis
+  pipeline.py      LUNAPipeline: fit / score / fit_blind / fit_combiner / calibrate /
+                   predict / evaluate / family_analysis / save / load
   scorers/         16 scorers in 4 families (uncertainty, distance, density, hybrid)
   combiners/       lightgbm (default), logistic, rank-average, xgboost
-  thresholding.py  FAR-calibrated thresholds
+  thresholding.py  conservative FAR thresholds and conformal p-values
   viz.py           detection map, complementarity map, ROC/PR, AUROC bars, UMAP
   style.py         publication figure standard (final-size figures, light+dark themes)
   report.py        ranked anomaly reports (CSV / LaTeX)
@@ -67,6 +82,17 @@ it in training, and calibrate thresholds on a held-out in-distribution split. Se
 the [ASTRAnet](https://github.com/applecider-ml/ASTRAnet) pipeline for a complete,
 worked example of this protocol on astronomical spectra (where LUNA serves as the
 anomaly-detection layer of a transient classifier).
+
+## Changes in 0.3
+
+- `fit_blind` adds the blind consensus to the pipeline. Its percentile ranks are frozen on
+  reference normals, so the score of an object no longer depends on the batch it is scored
+  with (in 0.2, `family_analysis` ranked the normals and the outliers together).
+- The thresholds are set on in-distribution objects that neither the scorers nor the
+  combiner have seen (in 0.2, `fit_combiner` calibrated on its own training normals), with
+  the conservative split-conformal order statistic.
+- `target_far` accepts several rates; `predict` returns a p-value and flags at each rate,
+  and `evaluate` reports the detection rate together with the realised false-alarm rate.
 
 ## Demo
 

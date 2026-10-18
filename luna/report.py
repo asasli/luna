@@ -13,6 +13,7 @@ def generate_anomaly_report(
     ensemble_score: np.ndarray,
     flags: np.ndarray,
     meta: list[dict] | None = None,
+    p_value: np.ndarray | None = None,
     class_names: list[str] | None = None,
     logits: np.ndarray | None = None,
     family_flags: dict[str, np.ndarray] | None = None,
@@ -23,6 +24,7 @@ def generate_anomaly_report(
         scores: {method_name: (N,) scores}
         ensemble_score: (N,) combined anomaly score
         flags: (N,) boolean flags
+        p_value: (N,) conformal p-values (optional)
         meta: list of per-sample metadata dicts (optional)
         class_names: class name strings (optional)
         logits: (N, C) logits for computing predictions/confidence (optional)
@@ -52,6 +54,8 @@ def generate_anomaly_report(
     # Ensemble score and flag
     report["ens_score"] = ensemble_score.round(4)
     report["flagged"] = flags
+    if p_value is not None:
+        report["p_value"] = np.asarray(p_value).round(4)
 
     # Per-family flags
     if family_flags is not None:
@@ -87,6 +91,8 @@ def generate_category_ablation(
             "AUROC": round(info["auroc"], 4),
             "Det@FAR": info["detected"],
             "Det%": round(info["det_rate"] * 100, 1),
+            **{f"Det% @ {100 * a:g}% FAR": round(100 * v, 1)
+               for a, v in info.get("det_rate_by_far", {}).items()},
         })
     return pd.DataFrame(rows)
 

@@ -14,6 +14,8 @@ class LightGBMCombiner(BaseCombiner):
         max_depth: maximum tree depth (default 4).
         learning_rate: boosting learning rate (default 0.05).
         random_state: random seed (default 42).
+        n_jobs: threads (default 1; the score matrices are small, and LightGBM's default
+            of every core can be orders of magnitude slower on a shared node).
     """
 
     def __init__(
@@ -22,11 +24,13 @@ class LightGBMCombiner(BaseCombiner):
         max_depth: int = 4,
         learning_rate: float = 0.05,
         random_state: int = 42,
+        n_jobs: int = 1,
     ):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.learning_rate = learning_rate
         self.random_state = random_state
+        self.n_jobs = n_jobs
         self._model = None
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> LightGBMCombiner:
@@ -43,6 +47,7 @@ class LightGBMCombiner(BaseCombiner):
             learning_rate=self.learning_rate,
             class_weight="balanced",
             random_state=self.random_state,
+            n_jobs=self.n_jobs,
             verbose=-1,
         )
         self._model.fit(X, y)
@@ -57,4 +62,5 @@ class LightGBMCombiner(BaseCombiner):
             max_depth=self.max_depth,
             learning_rate=self.learning_rate,
             random_state=self.random_state,
+            n_jobs=self.n_jobs,
         )
