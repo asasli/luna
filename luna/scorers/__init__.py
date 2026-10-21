@@ -12,6 +12,7 @@ import luna.scorers.uncertainty  # noqa: F401
 import luna.scorers.distance     # noqa: F401
 import luna.scorers.density      # noqa: F401
 import luna.scorers.hybrid       # noqa: F401
+import luna.scorers.mc_uncertainty  # noqa: F401
 
 __all__ = [
     "BaseScorer",
