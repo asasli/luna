@@ -26,7 +26,8 @@ def blind():
 def test_threshold_is_conservative_order_statistic():
     s = np.arange(1, 100, dtype=float)          # n = 99, (n + 1)(1 - 0.05) = 95
     assert calibrate_threshold(s, 0.05) == 95.0
-    assert calibrate_threshold(s, 0.001) == 99.0  # too few objects: the maximum
+    assert calibrate_threshold(s, 0.001) == float("inf")  # too few objects: no alarm can be supported
+    assert calibrate_threshold(s, 0.001, strict=False) == 99.0
 
 
 def test_p_values_match_thresholds():
@@ -94,3 +95,12 @@ def test_scalar_target_far_still_works():
     pipe = LUNAPipeline(scorers=SCORERS, target_far=0.05).fit(make(2000, seed=1))
     pipe.fit_blind(make(2000, seed=2), verbose=False)
     assert pipe.target_far == 0.05 and pipe.fars == (0.05,)
+
+
+def test_pipeline_pickled_by_v03_still_predicts(blind):
+    import pickle
+    old = pickle.loads(pickle.dumps(blind))
+    for attr in ("unit", "strict", "object_aggregate"):   # what a 0.3 pickle does not carry
+        old.__dict__.pop(attr, None)
+    x = make(200, seed=14)
+    assert np.array_equal(old.predict(x)["p_value"], blind.predict(x)["p_value"])

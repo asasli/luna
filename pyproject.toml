@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "luna-ood"
-version = "0.3.0"
+version = "0.4.1"
 description = "LUNA: classifier-agnostic OOD/novelty detection from embeddings + logits (16 scores, 4 families, trainable combiner)"
 readme = "README.md"
 requires-python = ">=3.10"

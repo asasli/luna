@@ -11,7 +11,12 @@ from sklearn.metrics import roc_auc_score
 
 from luna.scorers import SCORER_REGISTRY, get_available_scorers, get_scorer_families
 from luna.combiners import get_combiner, BaseCombiner, MeanRankCombiner
-from luna.thresholding import calibrate_threshold, calibrate_thresholds, apply_threshold, p_values
+from luna.thresholding import (calibrate_threshold, calibrate_thresholds, apply_threshold, p_values,
+                               aggregate_by_object)
+
+#: Optional data-dict key with the object identifier of each sample. When the calibration data
+#: carry it, LUNA calibrates, predicts and evaluates per object (see `calibrate`).
+OBJECT_KEY = "object_id"
 
 
 def _take(data: dict, idx: np.ndarray) -> dict:
@@ -21,6 +26,11 @@ def _take(data: dict, idx: np.ndarray) -> dict:
 
 def _n_rows(data: dict) -> int:
     return len(next(np.asarray(v) for v in data.values() if v is not None))
+
+
+def _scorer_data(data: dict) -> dict:
+    """The data dict without the object identifier (scorers never see it)."""
+    return {k: v for k, v in data.items() if k != OBJECT_KEY}
 
 
 class LUNAPipeline:
@@ -46,6 +56,12 @@ class LUNAPipeline:
         table = pipe.evaluate(test_normals, rare_data, groups=rare_families)
     """
 
+    # Defaults for pipelines pickled by LUNA 0.3, which have no such attributes: they were
+    # calibrated per sample, with the conservative (strict) threshold of 0.3.1.
+    unit: str | None = None
+    strict: bool = True
+    object_aggregate: str = "mean"
+
     def __init__(
         self,
         scorers: list[str] | None = None,
@@ -54,6 +70,8 @@ class LUNAPipeline:
         fine_to_coarse: dict[int, int] | None = None,
         scorer_kwargs: dict[str, dict] | None = None,
         combiner_kwargs: dict | None = None,
+        strict: bool = True,
+        object_aggregate: str = "mean",
     ):
         """
         Args:
@@ -65,6 +83,10 @@ class LUNAPipeline:
             fine_to_coarse: mapping fine class idx -> coarse class idx (for HEC).
             scorer_kwargs: per-scorer kwargs, e.g. {"odin": {"temperature": 2.0}}.
             combiner_kwargs: kwargs passed to the combiner constructor.
+            strict: if True (default), a rate that n calibration objects cannot guarantee gets an
+                infinite threshold (nothing flagged) instead of the largest calibration score.
+            object_aggregate: how per-sample scores become one object score when the data
+                carry `object_id`: "mean" (default) or "max" over the samples of the object.
         """
         self._requested_scorers = scorers
         self._combiner_spec = combiner
@@ -74,6 +96,9 @@ class LUNAPipeline:
         self.fine_to_coarse = fine_to_coarse
         self._scorer_kwargs = scorer_kwargs or {}
         self._combiner_kwargs = combiner_kwargs or {}
+        self.strict = bool(strict)
+        self.object_aggregate = object_aggregate
+        self.unit: str | None = None          # "sample" or "object", set by calibrate()
 
         self._scorers: dict[str, object] = {}
         self._combiner: BaseCombiner | None = None
@@ -138,7 +163,7 @@ class LUNAPipeline:
             scorer = cls(**kwargs)
             import time as _t
             _t0 = _t.time()
-            scorer.fit(train_data)
+            scorer.fit(_scorer_data(train_data))
             print(f"  [LUNA] fit {name} in {_t.time()-_t0:.1f}s", flush=True)
             self._scorers[name] = scorer
             self._active_methods.append(name)
@@ -164,7 +189,7 @@ class LUNAPipeline:
         # scores. Always recompute (fast with brute-kNN + shrinkage-cov scorers).
         scores = {}
         for name in self._active_methods:
-            scores[name] = self._scorers[name].score(data)
+            scores[name] = self._scorers[name].score(_scorer_data(data))
         return scores
 
     def _scores_to_matrix(self, scores: dict[str, np.ndarray]) -> np.ndarray:
@@ -257,26 +282,49 @@ class LUNAPipeline:
     ) -> LUNAPipeline:
         """Set the thresholds and the p-value reference on held-out in-distribution data.
 
+        If `calibration_data` carries `object_id`, the ensemble score of each object is the
+        aggregate (`object_aggregate`, the mean by default) over its samples, the thresholds are set
+        on the object scores, and `predict` / `evaluate` then work per object. Otherwise every
+        sample is a unit. Calibrate in the unit you report: a per-sample threshold flags an
+        object with K samples with a probability that grows with K.
+
         Can be called again on new normals (e.g. a new survey season) without refitting.
         """
         if not self._combiner_fitted:
             raise RuntimeError("Fit a combiner (fit_combiner or fit_blind) first.")
+        self.unit = "object" if calibration_data.get(OBJECT_KEY) is not None else "sample"
         cal_scores = self.score(calibration_data)
         cal = self._combiner.predict(self._scores_to_matrix(cal_scores))
+        if self.unit == "object":
+            ids = calibration_data[OBJECT_KEY]
+            cal = self._aggregate(cal, ids)
+            cal_scores = {m: self._aggregate(v, ids) for m, v in cal_scores.items()}
         self._cal_scores = np.sort(cal)
         self._cal_method_scores = {m: np.sort(v) for m, v in cal_scores.items()}
-        self._thresholds = calibrate_thresholds(cal, self.fars)
+        self._thresholds = calibrate_thresholds(cal, self.fars, self.strict)
         self._threshold = self._thresholds[self.target_far]
         if verbose:
             n = len(cal)
             for a, thr in self._thresholds.items():
-                small = " (too few calibration objects for this rate)" if (n + 1) * a < 1 else ""
+                small = " (too few calibration units for this rate)" if (n + 1) * a < 1 else ""
                 print(f"  [LUNA] Threshold @ FAR={a:.1%}: {thr:.4f} on {n} calibration "
-                      f"objects{small}")
+                      f"{self.unit}s{small}")
         return self
+
+    def _aggregate(self, values: np.ndarray, object_ids: np.ndarray) -> np.ndarray:
+        return aggregate_by_object(values, object_ids, self.object_aggregate)[1]
 
     @staticmethod
     def _split(data: dict, fraction: float, seed: int) -> tuple[dict, dict]:
+        """Random split of a data dict; whole objects stay together when it carries `object_id`."""
+        if data.get(OBJECT_KEY) is not None:
+            ids = np.asarray(data[OBJECT_KEY])
+            objects = np.random.default_rng(seed).permutation(np.unique(ids))
+            n_cal = int(round(fraction * len(objects)))
+            if n_cal < 1 or n_cal >= len(objects):
+                raise ValueError(f"cannot split {len(objects)} objects with cal_fraction={fraction}")
+            cal = np.isin(ids, objects[:n_cal])
+            return _take(data, np.flatnonzero(~cal)), _take(data, np.flatnonzero(cal))
         n = _n_rows(data)
         perm = np.random.default_rng(seed).permutation(n)
         n_cal = int(round(fraction * n))
@@ -293,25 +341,39 @@ class LUNAPipeline:
         """Full prediction: scores, ensemble, conformal p-value and flags at every rate.
 
         Args:
-            data: input data dict.
+            data: input data dict. When the pipeline was calibrated per object, it must carry
+                `object_id`, and every output below is per object (sorted object ids).
 
         Returns:
             Dict with:
-                "scores": dict of per-scorer arrays
-                "ensemble_score": (N,) combined anomaly score
-                "p_value": (N,) conformal p-value against the calibration objects
+                "unit": "sample" or "object"
+                "objects": object ids (None for unit "sample")
+                "scores": dict of per-scorer arrays (per unit)
+                "ensemble_score": (N,) combined anomaly score (per unit)
+                "p_value": (N,) conformal p-value against the calibration units
                 "flagged": (N,) boolean array at the main rate (first `target_far`)
                 "flags": {far: (N,) boolean array} for every calibrated rate
                 "threshold": float, main-rate threshold
                 "thresholds": {far: threshold}
+                "sample_ensemble_score": per-sample combined score (before aggregation)
         """
         if not self._combiner_fitted or self._cal_scores is None:
             raise RuntimeError("Call .fit_combiner() or .fit_blind() before .predict().")
 
         scores = self.score(data)
-        ens = self._combiner.predict(self._scores_to_matrix(scores))
+        ens_sample = self._combiner.predict(self._scores_to_matrix(scores))
+        objects, ens = None, ens_sample
+        if self.unit == "object":
+            if data.get(OBJECT_KEY) is None:
+                raise ValueError("calibrated per object: the data must carry 'object_id' "
+                                 "(calibrate in the unit you report)")
+            ids = data[OBJECT_KEY]
+            objects, ens = aggregate_by_object(ens_sample, ids, self.object_aggregate)
+            scores = {m: self._aggregate(v, ids) for m, v in scores.items()}
         flags = {a: apply_threshold(ens, thr) for a, thr in self._thresholds.items()}
         return {
+            "unit": self.unit,
+            "objects": objects,
             "scores": scores,
             "ensemble_score": ens,
             "p_value": p_values(ens, self._cal_scores),
@@ -319,6 +381,7 @@ class LUNAPipeline:
             "flags": flags,
             "threshold": self._threshold,
             "thresholds": dict(self._thresholds),
+            "sample_ensemble_score": ens_sample,
         }
 
     def evaluate(
@@ -336,12 +399,13 @@ class LUNAPipeline:
         Args:
             id_data: independent in-distribution test objects.
             ood_data: anomalies.
-            groups: optional label per anomaly (e.g. its family), for per-group rows.
+            groups: optional label per anomaly (e.g. its family), for per-group rows; one label
+                per sample or, for a per-object pipeline, one per object (sorted ids).
             methods: also report every single scorer, thresholded on the same calibration
-                objects (requires the calibration scores, kept by `calibrate`).
+                units (requires the calibration scores, kept by `calibrate`).
 
         Returns:
-            DataFrame with one row per (rule, rate, group): target FAR, realised FPR on
+            DataFrame with one row per (rule, rate, group): unit, target FAR, realised FPR on
             `id_data`, AUROC, number detected and detection rate.
         """
         pi, po = self.predict(id_data), self.predict(ood_data)
@@ -351,8 +415,12 @@ class LUNAPipeline:
                 raise RuntimeError("per-method thresholds need calibrate() from v0.3")
             for m in self._active_methods:
                 rules[m] = (pi["scores"][m], po["scores"][m],
-                            calibrate_thresholds(self._cal_method_scores[m], self.fars))
-        groups = None if groups is None else np.asarray(groups)
+                            calibrate_thresholds(self._cal_method_scores[m], self.fars, self.strict))
+        if groups is not None:
+            groups = np.asarray(groups)
+            if self.unit == "object" and len(groups) != len(po["objects"]):
+                ids = np.asarray(ood_data[OBJECT_KEY])
+                groups = np.array([groups[np.flatnonzero(ids == o)[0]] for o in po["objects"]])
         sel = {"all": np.ones(len(po["ensemble_score"]), bool)}
         if groups is not None:
             sel.update({g: groups == g for g in sorted(set(groups))})
@@ -363,8 +431,8 @@ class LUNAPipeline:
                 for g, mask in sel.items():
                     n = int(mask.sum())
                     y = np.r_[np.zeros(len(si)), np.ones(n)]
-                    rows.append(dict(rule=rule, target_far=a, realised_fpr=fpr, group=g, n=n,
-                                     auroc=roc_auc_score(y, np.r_[si, so[mask]]),
+                    rows.append(dict(rule=rule, unit=self.unit, target_far=a, realised_fpr=fpr,
+                                     group=g, n=n, auroc=roc_auc_score(y, np.r_[si, so[mask]]),
                                      detected=int((so[mask] > t).sum()),
                                      det_rate=float((so[mask] > t).mean())))
         return pd.DataFrame(rows)
@@ -393,7 +461,9 @@ class LUNAPipeline:
         Within each scorer family, the scores are combined as the mean percentile rank. The
         ranks are read from one half of `id_data` and frozen, the thresholds are set on the
         other half, and the AUROC compares that second half with the anomalies, so the result
-        for an anomaly does not depend on which other anomalies are scored with it.
+        for an anomaly does not depend on which other anomalies are scored with it. When both
+        data dicts carry `object_id`, the halves keep whole objects and every family score is
+        aggregated per object before thresholding.
 
         Args:
             id_data: in-distribution data (not used to fit the scorers).
@@ -406,9 +476,7 @@ class LUNAPipeline:
         """
         ref_data, cal_data = self._split(id_data, 0.5, seed)
         ref, cal, ood = (self.score(d) for d in (ref_data, cal_data, ood_data))
-        n_cal = len(next(iter(cal.values())))
-        n_ood = len(next(iter(ood.values())))
-        y = np.concatenate([np.zeros(n_cal), np.ones(n_ood)])
+        per_object = cal_data.get(OBJECT_KEY) is not None and ood_data.get(OBJECT_KEY) is not None
 
         result = {}
         for fam, methods in self.families.items():
@@ -416,12 +484,16 @@ class LUNAPipeline:
                                           np.zeros(len(ref[methods[0]]), dtype=int))
             rank_cal = comb.predict(np.column_stack([cal[m] for m in methods]))
             rank_ood = comb.predict(np.column_stack([ood[m] for m in methods]))
-            thr = calibrate_thresholds(rank_cal, self.fars)
+            if per_object:
+                rank_cal = self._aggregate(rank_cal, cal_data[OBJECT_KEY])
+                rank_ood = self._aggregate(rank_ood, ood_data[OBJECT_KEY])
+            thr = calibrate_thresholds(rank_cal, self.fars, self.strict)
             flags = rank_ood > thr[self.target_far]
+            y = np.concatenate([np.zeros(len(rank_cal)), np.ones(len(rank_ood))])
             result[fam] = {
                 "auroc": roc_auc_score(y, np.concatenate([rank_cal, rank_ood])),
                 "detected": int(flags.sum()),
-                "total": n_ood,
+                "total": len(rank_ood),
                 "det_rate": flags.mean(),
                 "flags": flags,
                 "det_rate_by_far": {a: float((rank_ood > v).mean()) for a, v in thr.items()},
@@ -456,6 +528,9 @@ class LUNAPipeline:
             plot_complementarity_map,
         )
 
+        if self.unit == "object":
+            raise NotImplementedError("report() writes per-sample tables; for a pipeline "
+                                      "calibrated per object use predict() and evaluate()")
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
